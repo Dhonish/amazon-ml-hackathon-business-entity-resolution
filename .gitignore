@@ -1,0 +1,26 @@
+# Virtual environment
+.venv/
+
+# Dataset - DO NOT UPLOAD
+dataset/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Generated submission files
+output/matching_results.tsv
+output/candidate_pairs.tsv
+output/prediction.db
+output/*.db
+output/*.sqlite
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
