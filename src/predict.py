@@ -1,9 +1,16 @@
 import os
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
 import sys
 import time
 import joblib
+import warnings
 import multiprocessing as mp
 import pandas as pd
+
+warnings.filterwarnings("ignore")
 
 try:
     from .blocking import get_blocks
@@ -23,26 +30,75 @@ S3_FILE = "dataset/test/test_source3.tsv"
 MATCHING_FILE = "output/matching_results.tsv"
 CANDIDATE_FILE = "output/candidate_pairs.tsv"
 
-SCORE_BATCH_SIZE = 200000
-MAX_BLOCK_SIZE = 40
-MAX_CANDIDATES_PER_S1 = 25
+SCORE_BATCH_SIZE = 50000
+MAX_BLOCK_SIZE = 35
+MAX_CANDIDATES_PER_S1 = 15
+DEFAULT_THRESHOLD = 0.80
 
 
 def p(msg):
     print(msg, flush=True)
 
 
-def make_features_wrapper(pair):
-    a, b = pair
-    return make_features(a, b)
+def score_worker_chunk(chunk_args):
+    s1_chunk_ids, s1_norm_chunk, candidates_map_chunk, target_norm_chunk, model_path, threshold = chunk_args
+
+    model_obj = joblib.load(model_path)
+    if isinstance(model_obj, dict):
+        model = model_obj["model"]
+        feature_names = model_obj.get("feature_names", None)
+    else:
+        model = model_obj
+        feature_names = None
+
+    local_matched = {}
+    batch_feats = []
+    batch_pair_ids = []
+
+    def run_batch():
+        nonlocal batch_feats, batch_pair_ids
+        if not batch_feats:
+            return
+        X_df = pd.DataFrame(batch_feats)
+        if feature_names:
+            X_df = X_df[feature_names]
+        probs = model.predict_proba(X_df)[:, 1]
+
+        for (s_id, t_id), prob in zip(batch_pair_ids, probs):
+            if prob >= threshold:
+                local_matched.setdefault(s_id, []).append(t_id)
+
+        batch_feats = []
+        batch_pair_ids = []
+
+    for s1_id in s1_chunk_ids:
+        cands = candidates_map_chunk.get(s1_id, [])
+        if not cands:
+            continue
+
+        a = s1_norm_chunk[s1_id]
+        for tid in cands:
+            if tid not in target_norm_chunk:
+                continue
+            b = target_norm_chunk[tid]
+            feats = make_features(a, b)
+
+            batch_feats.append(feats)
+            batch_pair_ids.append((s1_id, tid))
+
+            if len(batch_feats) >= SCORE_BATCH_SIZE:
+                run_batch()
+
+    run_batch()
+    return local_matched
 
 
 def main():
     t_start = time.time()
-    num_cpus = os.cpu_count() or 4
+    num_workers = min(os.cpu_count() or 4, 8)
     p("==================================================")
-    p("STARTING OPTIMIZED HIGH-RECALL PREDICTION PIPELINE")
-    p(f"CPU Cores: {num_cpus} | Max Block Size: {MAX_BLOCK_SIZE} | Max Candidates/S1: {MAX_CANDIDATES_PER_S1}")
+    p("STARTING PARALLEL HIGH-PRECISION PREDICTION PIPELINE")
+    p(f"CPU Workers: {num_workers} | Max Block Size: {MAX_BLOCK_SIZE} | Max Candidates/S1: {MAX_CANDIDATES_PER_S1}")
     p("==================================================")
 
     if not os.path.exists(MODEL_PATH):
@@ -50,17 +106,16 @@ def main():
         from train import main as train_main
         train_main()
 
-    p("\n[1/5] Loading trained ML model & decision threshold...")
+    p("\n[1/5] Loading trained 20-feature ML model info...")
     model_obj = joblib.load(MODEL_PATH)
-
     if isinstance(model_obj, dict):
         model = model_obj["model"]
-        threshold = model_obj.get("best_threshold", 0.85)
+        threshold = model_obj.get("best_threshold", DEFAULT_THRESHOLD)
     else:
         model = model_obj
-        threshold = 0.85
+        threshold = DEFAULT_THRESHOLD
 
-    p(f"Model loaded successfully. Optimal F0.5 Threshold: {threshold:.2f}")
+    p(f"Model loaded successfully (n_features_in_={model.n_features_in_}). Decision Threshold: {threshold:.2f}")
 
     p("\n[2/5] Loading Source 1 test dataset...")
     s1_df = pd.read_csv(
@@ -74,19 +129,23 @@ def main():
     p(f"Total Source 1 test entities: {len(s1_ids):,}")
 
     p("\n[3/5] Pre-normalizing S1 entities and building multi-key block index...")
-    s1_raw = {}
+    s1_norm = {}
     block_to_s1 = {}
     tracker = ProgressTracker(len(s1_ids), "S1 Pre-processing", update_interval_sec=10)
 
     for row in s1_df.itertuples(index=False):
         eid = row.entity_id
-        s1_raw[eid] = (row.business_name, row.business_address, row.country)
+        b_name = normalize_name(row.business_name)
+        b_addr = normalize_address(row.business_address)
+        b_ctry = normalize_text(row.country)
 
-        keys = get_blocks(
-            row.business_name,
-            row.business_address,
-            row.country
-        )
+        s1_norm[eid] = {
+            "name_norm": b_name,
+            "address_norm": b_addr,
+            "country_norm": b_ctry
+        }
+
+        keys = get_blocks(row.business_name, row.business_address, row.country)
         for k in keys:
             block_to_s1.setdefault(k, []).append(eid)
         tracker.update(1)
@@ -100,8 +159,8 @@ def main():
             del block_to_s1[k]
 
     p("\n[4/5] Streaming target dataset scanning (test_source2 & test_source3)...")
-    candidates_map = {eid: [] for eid in s1_ids}
-    target_raw = {}
+    candidates_scores = {eid: {} for eid in s1_ids}
+    target_norm = {}
     raw_hits = 0
     t_scan_start = time.time()
 
@@ -131,9 +190,14 @@ def main():
                         matched_s1.update(block_to_s1[k])
 
                 if matched_s1:
-                    target_raw[tid] = (b_name, b_addr, b_ctry)
+                    target_norm[tid] = {
+                        "name_norm": normalize_name(b_name),
+                        "address_norm": normalize_address(b_addr),
+                        "country_norm": normalize_text(b_ctry)
+                    }
                     for s1_id in matched_s1:
-                        candidates_map[s1_id].append(tid)
+                        scores = candidates_scores[s1_id]
+                        scores[tid] = scores.get(tid, 0) + 1
                         raw_hits += 1
 
                 if processed_lines % 1000000 == 0:
@@ -143,79 +207,61 @@ def main():
 
         p(f"  Finished {file_path} | Lines: {processed_lines:,}")
 
-    p("\nOptimizing candidate pairs per S1 entity...")
+    p("\nPriority-ranking candidates per S1 entity by blocking hit strength...")
+    candidates_map = {}
     total_candidate_pairs = 0
+
     for s1_id in s1_ids:
-        cands = candidates_map[s1_id]
-        if cands:
-            unique_cands = list(dict.fromkeys(cands))[:MAX_CANDIDATES_PER_S1]
-            candidates_map[s1_id] = unique_cands
-            total_candidate_pairs += len(unique_cands)
+        scores = candidates_scores[s1_id]
+        if scores:
+            sorted_cands = sorted(scores.keys(), key=lambda t: scores[t], reverse=True)[:MAX_CANDIDATES_PER_S1]
+            candidates_map[s1_id] = sorted_cands
+            total_candidate_pairs += len(sorted_cands)
+        else:
+            candidates_map[s1_id] = []
 
-    p(f"Candidate Generation Complete. Total Candidate Pairs to Score: {total_candidate_pairs:,}")
+    del candidates_scores
 
-    p("\n[5/5] Parallel Feature Extraction & Model Scoring across CPU cores...")
-    matched_map = {eid: [] for eid in s1_ids}
+    p(f"Candidate Generation Complete. Total Priority-Ranked Pairs to Score: {total_candidate_pairs:,}")
 
-    s1_norm_cache = {}
-    target_norm_cache = {}
+    p(f"\n[5/5] Parallel Feature Extraction & Scoring across {num_workers} worker processes...")
+    chunk_size = (len(s1_ids) + num_workers - 1) // num_workers
+    worker_tasks = []
 
-    batch_pairs = []
-    batch_pair_ids = []
+    for i in range(num_workers):
+        chunk_s1_ids = s1_ids[i * chunk_size: (i + 1) * chunk_size]
+        if not chunk_s1_ids:
+            continue
 
-    score_tracker = ProgressTracker(total_candidate_pairs, "Pair Scoring", update_interval_sec=10)
+        s1_norm_chunk = {eid: s1_norm[eid] for eid in chunk_s1_ids}
+        candidates_map_chunk = {eid: candidates_map[eid] for eid in chunk_s1_ids}
 
-    with mp.Pool(processes=num_cpus) as scoring_pool:
-        for s1_id in s1_ids:
-            cands = candidates_map[s1_id]
-            if not cands:
-                continue
+        target_ids_needed = set()
+        for cands in candidates_map_chunk.values():
+            target_ids_needed.update(cands)
 
-            if s1_id not in s1_norm_cache:
-                b_name, b_addr, b_ctry = s1_raw[s1_id]
-                s1_norm_cache[s1_id] = {
-                    "name_norm": normalize_name(b_name),
-                    "address_norm": normalize_address(b_addr),
-                    "country_norm": normalize_text(b_ctry)
-                }
-            a = s1_norm_cache[s1_id]
+        target_norm_chunk = {tid: target_norm[tid] for tid in target_ids_needed if tid in target_norm}
 
-            for tid in cands:
-                if tid not in target_norm_cache:
-                    tb_name, tb_addr, tb_ctry = target_raw[tid]
-                    target_norm_cache[tid] = {
-                        "name_norm": normalize_name(tb_name),
-                        "address_norm": normalize_address(tb_addr),
-                        "country_norm": normalize_text(tb_ctry)
-                    }
-                b = target_norm_cache[tid]
+        worker_tasks.append((
+            chunk_s1_ids,
+            s1_norm_chunk,
+            candidates_map_chunk,
+            target_norm_chunk,
+            MODEL_PATH,
+            threshold
+        ))
 
-                batch_pairs.append((a, b))
-                batch_pair_ids.append((s1_id, tid))
+    del s1_norm
+    del target_norm
 
-                if len(batch_pairs) >= SCORE_BATCH_SIZE:
-                    feats = scoring_pool.map(make_features_wrapper, batch_pairs, chunksize=10000)
-                    X = pd.DataFrame(feats)
-                    probs = model.predict_proba(X)[:, 1]
-                    for (s_id, t_id), prob in zip(batch_pair_ids, probs):
-                        if prob >= threshold:
-                            matched_map[s_id].append(t_id)
+    matched_map = {}
 
-                    score_tracker.update(len(batch_pairs))
-                    batch_pairs = []
-                    batch_pair_ids = []
+    with mp.Pool(processes=len(worker_tasks)) as pool:
+        results = pool.map(score_worker_chunk, worker_tasks)
+        for res in results:
+            matched_map.update(res)
 
-        if batch_pairs:
-            feats = scoring_pool.map(make_features_wrapper, batch_pairs, chunksize=10000)
-            X = pd.DataFrame(feats)
-            probs = model.predict_proba(X)[:, 1]
-            for (s_id, t_id), prob in zip(batch_pair_ids, probs):
-                if prob >= threshold:
-                    matched_map[s_id].append(t_id)
-
-            score_tracker.update(len(batch_pairs))
-
-    p("\nWriting final output TSV files...")
+    p("\nWriting final submission TSV files...")
     os.makedirs("output", exist_ok=True)
 
     with open(MATCHING_FILE, "w", encoding="utf-8") as fm, open(CANDIDATE_FILE, "w", encoding="utf-8") as fc:
